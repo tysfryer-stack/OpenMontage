@@ -5,9 +5,12 @@ If these fail, every other test in the suite is one bug away from spending money
 
 from __future__ import annotations
 
+import os
 import socket
 
 import pytest
+
+from tests import conftest
 
 from tools.graphics.atlas_image import AtlasImage
 from tools.video.atlas_video import AtlasVideo
@@ -74,3 +77,48 @@ class TestLiveApiMarkerIsSkipped:
             "A @live_api test executed without OPENMONTAGE_ALLOW_NETWORK=1 — "
             "the opt-in gate is broken and real spending is possible."
         )
+
+
+class TestProxyBypassIsClosed:
+    """A socket-layer guard is blind to proxies unless it defends against them.
+
+    With HTTPS_PROXY set, an HTTP client connects to the proxy and names the
+    real host inside a CONNECT request. A loopback proxy therefore looked like
+    permitted local traffic, and paid calls sailed through a guard that still
+    reported itself healthy.
+    """
+
+    def test_proxy_env_is_unset_during_the_session(self):
+        """Defence 1: clients must resolve the true host, so they hit the wall."""
+        for var in conftest._PROXY_ENV_VARS:
+            assert var not in os.environ, (
+                f"{var} is set during a guarded test session; HTTP clients would "
+                f"connect to the proxy instead of the provider and slip past the "
+                f"socket guard."
+            )
+
+    def test_configured_loopback_proxy_is_blocked(self, monkeypatch):
+        """Defence 2: an explicitly-passed proxy is refused despite being local."""
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:33611")
+        proxies = conftest._proxy_endpoints()
+        assert conftest._matches_proxy(("127.0.0.1", 33611), proxies)
+        # Same endpoint by another spelling of loopback.
+        assert conftest._matches_proxy(("localhost", 33611), proxies)
+        # A different local port is ordinary loopback traffic and stays allowed.
+        assert not conftest._matches_proxy(("127.0.0.1", 8000), proxies)
+
+    def test_proxy_without_explicit_port_matches_any_port(self, monkeypatch):
+        monkeypatch.setenv("ALL_PROXY", "proxy.internal")
+        proxies = conftest._proxy_endpoints()
+        assert conftest._matches_proxy(("proxy.internal", 3128), proxies)
+        assert conftest._matches_proxy(("proxy.internal", 8080), proxies)
+
+    def test_no_proxy_configured_blocks_nothing_extra(self, monkeypatch):
+        for var in conftest._PROXY_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        assert conftest._proxy_endpoints() == set()
+        assert not conftest._matches_proxy(("127.0.0.1", 33611), set())
+
+    def test_malformed_proxy_url_does_not_crash_collection(self, monkeypatch):
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:not-a-port")
+        conftest._proxy_endpoints()  # must not raise
